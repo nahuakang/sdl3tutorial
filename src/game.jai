@@ -15,6 +15,16 @@ screen_height :: 480;
 window: *sdl.Window;
 
 
+offset_of :: ($T: Type, $member: string) -> int {
+    for type_info(T).members {
+        if it.name == member return it.offset_in_bytes;
+    }
+
+    assert(false, "Type '%' does not have member '%'", T, member);
+    return -1;
+}
+
+
 load_shader :: (device: *sdl.GPU_Device, shader_code: string, stage: sdl.GPU_Shader_Stage, num_uniform_buffers: u32) -> *sdl.GPU_Shader {
     create_info := sdl.GPU_Shader_Create_Info.{
         code_size           = cast(u64) shader_code.count,
@@ -39,19 +49,98 @@ main :: () {
     gpu    := sdl.create_gpu_device(.SPIRV, true, null); assert(gpu != null);
     ok      = sdl.claim_window_for_gpu_device(gpu, window); assert(ok);
 
-    // Load shaders
+    // Load Shaders
     vert_shader := load_shader(gpu, shader_code=vert_shader_code, stage=.VERTEX, num_uniform_buffers=1);
     frag_shader := load_shader(gpu, shader_code=frag_shader_code, stage=.FRAGMENT, num_uniform_buffers=0);
+
+    // Create Vertex Data
+    Vec3 :: [3]float32;
+    Vertex_Data :: struct {
+        pos:   Vec3;
+        color: sdl.F_Color;
+    }
+    vertices := Vertex_Data.[
+        .{ pos = .[-0.5, -0.5,    0], color = .{1, 0, 0, 1} },
+        .{ pos = .[   0,  0.5,    0], color = .{0, 1, 0, 1} },
+        .{ pos = .[ 0.5, -0.5,    0], color = .{0, 0, 1, 1} },
+    ];
+    vertices_byte_size := vertices.count * size_of(Vertex_Data);
+
+    // Describe vertex attributes and vertex buffers in pipeline
+    vertex_attributes: []sdl.GPU_Vertex_Attribute = .[
+        // For position data
+        .{
+            location = 0,       // As specified in the vertex shader
+            format   = .FLOAT3, // sdl.GPU_Vertex_Element_Format
+            offset   = xx offset_of(Vertex_Data, "pos"),
+        },
+        // For color data
+        .{
+            location = 1,
+            format   = .FLOAT4,
+            offset   = xx offset_of(Vertex_Data, "color"),
+        },
+    ];
+    vertex_buffer_descriptions: []sdl.GPU_Vertex_Buffer_Description = .[
+        .{
+            slot   = 0,
+            pitch  = size_of(Vertex_Data),
+        },
+    ];
+
+    // Create Vertex Buffer
+    buffer_create_info := sdl.GPU_Buffer_Create_Info.{
+        usage = .VERTEX,
+        size  = xx vertices_byte_size,
+    };
+    vertex_buffer := sdl.create_gpu_buffer(gpu, *buffer_create_info);
+
+    // Upload vertex data to the vertex buffer
+    // - Create Transfer Buffer
+    transfer_buffer_info: sdl.GPU_Transfer_Buffer_Create_Info = .{
+        usage = .UPLOAD,
+        size  = xx vertices_byte_size,
+    };
+    transfer_buffer := sdl.create_gpu_transfer_buffer(gpu, *transfer_buffer_info);
+    // - Map transfer buffer memory and copy from CPU
+    transfer_memory := sdl.map_gpu_transfer_buffer(gpu, transfer_buffer, false);
+    memcpy(transfer_memory, vertices.data, vertices_byte_size);
+    sdl.unmap_gpu_transfer_buffer(gpu, transfer_buffer);
+    // - Begin copy pass
+    copy_cmd_buf := sdl.acquire_gpu_command_buffer(gpu);
+    copy_pass := sdl.begin_gpu_copy_pass(copy_cmd_buf);
+    // - Invoke upload commands
+    source: sdl.GPU_Transfer_Buffer_Location = .{
+        transfer_buffer = transfer_buffer,
+        offset          = 0,
+    };
+    dest:   sdl.GPU_Buffer_Region = .{
+        buffer = vertex_buffer,
+        offset = 0,
+        size   = xx vertices_byte_size,
+    };
+    // - End copy pass and submit
+    sdl.upload_to_gpu_buffer(copy_pass, *source, *dest, false);
+    sdl.end_gpu_copy_pass(copy_pass);
+    ok = sdl.submit_gpu_command_buffer(copy_cmd_buf); assert(ok);
+    sdl.release_gpu_transfer_buffer(gpu, transfer_buffer);
+
 
     // Set up pipeline
     color_desc := sdl.GPU_Color_Target_Description.{
         format = sdl.get_gpu_swapchain_texture_format(gpu, window),
     };
     create_info := sdl.GPU_Graphics_Pipeline_Create_Info.{
-        vertex_shader   = vert_shader,
-        fragment_shader = frag_shader,
-        primitive_type  = .TRIANGLELIST,
-        target_info     = sdl.GPU_Graphics_Pipeline_Target_Info.{
+        vertex_shader       = vert_shader,
+        fragment_shader     = frag_shader,
+        vertex_input_state  = sdl.GPU_Vertex_Input_State.{
+            vertex_buffer_descriptions = vertex_buffer_descriptions.data,
+            num_vertex_buffers         = 1,
+            vertex_attributes          = vertex_attributes.data,
+            num_vertex_attributes      = xx vertex_attributes.count,
+        },
+        primitive_type      = .TRIANGLELIST,
+        target_info         = sdl.GPU_Graphics_Pipeline_Target_Info.{
             color_target_descriptions = *color_desc,
             num_color_targets         = 1,
         },
@@ -101,7 +190,7 @@ main :: () {
             }
         }
 
-        // Update game state
+        /* UPDATE GAME STATE */
 
         // Render
         cmd_buf := sdl.acquire_gpu_command_buffer(gpu);
@@ -127,9 +216,14 @@ main :: () {
                 store_op    = .STORE,
             };
             render_pass := sdl.begin_gpu_render_pass(cmd_buf, *color_target, 1, null);
-
             sdl.bind_gpu_graphics_pipeline(render_pass, pipeline);
-            // Vertex attributes - per vertex
+            // Bind vertex buffer to the draw call
+            vertex_buffers: []sdl.GPU_Buffer_Binding = .[
+                .{
+                    buffer = vertex_buffer,
+                },
+            ];
+            sdl.bind_gpu_vertex_buffers(render_pass, 0, vertex_buffers.data, 1);
             // Uniform data: command_buffer, binding number (slot index),
             sdl.push_gpu_vertex_uniform_data(cmd_buf, 0, *ubo, size_of(UBO));
             sdl.draw_gpu_primitives(render_pass, 3, 1, 0, 0);
